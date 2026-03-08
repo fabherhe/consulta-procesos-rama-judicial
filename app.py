@@ -56,6 +56,27 @@ def append_log(message: str, container, log_box):
 def main():
     # We render the full Streamlit interface.
     init_state()
+    st.markdown(
+        """
+        <style>
+            .footer-note {
+                position: fixed;
+                right: 16px;
+                bottom: 10px;
+                z-index: 9999;
+                font-size: 0.85rem;
+                color: #6b7280;
+                background: rgba(255, 255, 255, 0.75);
+                padding: 6px 10px;
+                border-radius: 10px;
+                backdrop-filter: blur(4px);
+            }
+        </style>
+        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito 💕</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
 
     st.title("Consulta de radicados en Rama Judicial")
     st.write(
@@ -93,7 +114,7 @@ def main():
         return
 
     st.subheader("Vista previa del archivo subido")
-    st.dataframe(input_df.head(20), use_container_width=True)
+    st.dataframe(input_df.head(20), width="stretch")
 
     col1, col2 = st.columns(2)
     with col1:
@@ -108,7 +129,7 @@ def main():
             input_df.columns.tolist(),
         )
 
-    run_button = st.button("Ejecutar consulta", type="primary", use_container_width=True)
+    run_button = st.button("Ejecutar consulta", type="primary", width="stretch")
 
     if run_button:
         st.session_state.log_lines = []
@@ -173,20 +194,20 @@ def main():
         result_df = st.session_state.result_df
 
         st.subheader("Vista previa del resultado")
-        st.dataframe(result_df.head(100), use_container_width=True)
+        st.dataframe(result_df.head(100), width="stretch")
 
         st.download_button(
             label="Descargar Excel resultado",
             data=st.session_state.result_bytes,
             file_name=st.session_state.result_filename,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
+            width="stretch",
         )
 
         if "status_rama" in result_df.columns:
             st.subheader("Resumen rápido")
             summary = result_df["status_rama"].value_counts(dropna=False).rename_axis("status_rama").reset_index(name="filas")
-            st.dataframe(summary, use_container_width=True)
+            st.dataframe(summary, width="stretch")
 
 
 if __name__ == "__main__":
