@@ -61,7 +61,7 @@ def main():
         <style>
             .footer-note {
                 position: fixed;
-                right: 16px;
+                left: 16px;
                 bottom: 10px;
                 z-index: 9999;
                 font-size: 0.85rem;
