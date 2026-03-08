@@ -17,6 +17,7 @@ MAX_SEARCH_RETRIES = 3
 MAX_DETAIL_OPEN_RETRIES = 2
 MAX_DETAIL_DATA_RETRIES = 3
 MAX_ACTUACIONES_RETRIES = 3
+MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES = 3
 
 DATE_YMD_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 DATE_MDY_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
@@ -452,6 +453,12 @@ def search_with_retries(page, rad: str, log: LogFn, max_retries: int = 3):
         last_error = f"Estado inesperado: {outcome}"
         close_popup_with_back(page)
         human_pause(1200, 2200)
+
+    if network_error_retries >= max_retries and last_error == "Network Error":
+        raise RuntimeError(
+            "NETWORK_ERROR_PERSISTENT: "
+            f"La Rama devolvió 'Network Error' en los {max_retries} intentos del radicado {rad}."
+        )
 
     raise RuntimeError(
         f"No fue posible consultar el radicado {rad} después de {max_retries} intentos. "
@@ -1024,6 +1031,7 @@ def process_dataframe(
     resultados = []
     total = len(df)
     include_compare = bool(compare_date_col)
+    consecutive_search_network_failures = 0
 
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/tmp/pw-browsers")
 
@@ -1056,9 +1064,11 @@ def process_dataframe(
                 log("    -> Radicado inválido. Se omite.")
                 continue
 
+
             try:
                 search_info = search_with_retries(page, rad, log=log, max_retries=MAX_SEARCH_RETRIES)
                 extra_data.update(search_info)
+                consecutive_search_network_failures = 0
 
                 detail_open_info = open_detail_with_retries(
                     page,
@@ -1104,10 +1114,33 @@ def process_dataframe(
                         )
 
             except Exception as exc:
-                extra_data["status_rama"] = "error"
-                extra_data["error_rama"] = f"{type(exc).__name__}: {exc}"
+                message = f"{type(exc).__name__}: {exc}"
+
+                if "NETWORK_ERROR_PERSISTENT" in str(exc):
+                    consecutive_search_network_failures += 1
+                    extra_data["status_rama"] = "network_error"
+                    extra_data["error_rama"] = (
+                        "La consulta devolvió 'Network Error' en todos los reintentos. "
+                        "Posible bloqueo o indisponibilidad del portal desde el entorno de despliegue."
+                    )
+                    log(
+                        "    -> Falla persistente de red al consultar Rama. "
+                        f"Consecutivas: {consecutive_search_network_failures}/"
+                        f"{MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES}."
+                    )
+                else:
+                    consecutive_search_network_failures = 0
+                    extra_data["status_rama"] = "error"
+                    extra_data["error_rama"] = message
 
             resultados.append(merge_row(base_row, extra_data))
+
+            if consecutive_search_network_failures >= MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES:
+                raise RuntimeError(
+                    "Se detectaron fallas de red persistentes en consultas consecutivas a Rama Judicial. "
+                    "La ejecución se detiene para evitar reprocesar todo el archivo sin resultados. "
+                    "Reintenta más tarde o despliega en otro proveedor/región."
+                )
             human_pause(1200, 2800)
 
         browser.close()
