@@ -12,6 +12,11 @@ from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 URL = "https://consultaprocesos.ramajudicial.gov.co/Procesos/NumeroRadicacion"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 MAX_SEARCH_RETRIES = 3
 MAX_DETAIL_OPEN_RETRIES = 2
@@ -1042,10 +1047,24 @@ def process_dataframe(
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
+                "--disable-blink-features=AutomationControlled",
             ],
         )
-        page = browser.new_page()
-        page.set_viewport_size({"width": 1400, "height": 900})
+        context = browser.new_context(
+            user_agent=DEFAULT_USER_AGENT,
+            locale="es-CO",
+            timezone_id="America/Bogota",
+            viewport={"width": 1400, "height": 900},
+            extra_http_headers={
+                "Accept-Language": "es-CO,es;q=0.9,en-US;q=0.8,en;q=0.7",
+            },
+        )
+        page = context.new_page()
+        page.add_init_script(
+            """
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            """
+        )
 
         reset_to_search(page)
 
@@ -1143,6 +1162,7 @@ def process_dataframe(
                 )
             human_pause(1200, 2800)
 
+        context.close()
         browser.close()
 
     out_df = pd.DataFrame(resultados)
