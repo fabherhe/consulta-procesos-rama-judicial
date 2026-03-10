@@ -18,8 +18,19 @@ BLOCKED_BOOT_MESSAGE = "3 radicados validos consecutivos con 'Network Error' al 
 st.set_page_config(page_title="Consulta Rama Judicial", page_icon="R", layout="wide")
 
 
+def streamlit_version_tuple() -> tuple[int, int, int]:
+    # We parse Streamlit version without external dependencies.
+    parts = []
+    for token in st.__version__.split(".")[:3]:
+        digits = "".join(ch for ch in token if ch.isdigit())
+        parts.append(int(digits or "0"))
+    while len(parts) < 3:
+        parts.append(0)
+    return parts[0], parts[1], parts[2]
+
+
 def get_scraper_module():
-    # We import scraper lazily and retry once if import cache gets inconsistent.
+    # We import scraper lazily and retry if import cache gets inconsistent.
     import importlib
 
     module_name = "rama_scraper"
@@ -62,11 +73,7 @@ def ensure_chromium_installed() -> tuple[bool, str]:
 def init_state():
     # We initialize all session keys used by the app.
     defaults = {
-        "result_df": None,
-        "result_bytes": None,
-        "result_filename": None,
         "log_lines": [],
-        "run_finished": False,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -88,7 +95,7 @@ def build_run_key(
     radicado_col: str,
     compare_date_col: Optional[str],
 ) -> str:
-    # We generate a deterministic key for persisted progress for this exact run configuration.
+    # We generate a deterministic key for this exact run configuration.
     hasher = hashlib.sha256()
     hasher.update(file_bytes)
     hasher.update(filename.encode("utf-8", errors="ignore"))
@@ -98,12 +105,13 @@ def build_run_key(
     return hasher.hexdigest()[:24]
 
 
-def checkpoint_paths(run_key: str) -> tuple[Path, Path]:
-    # We map a run key to its dataframe and metadata files.
+def checkpoint_paths(run_key: str) -> tuple[Path, Path, Path]:
+    # We map a run key to persisted dataframe, metadata and downloadable excel files.
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     data_path = CHECKPOINT_DIR / f"{run_key}.pkl"
     meta_path = CHECKPOINT_DIR / f"{run_key}.json"
-    return data_path, meta_path
+    excel_path = CHECKPOINT_DIR / f"{run_key}.xlsx"
+    return data_path, meta_path, excel_path
 
 
 def save_checkpoint(
@@ -113,11 +121,15 @@ def save_checkpoint(
     total_rows: int,
     status: str,
     error_text: str,
+    excel_bytes: Optional[bytes] = None,
 ):
     # We persist progress so users can continue after crashes or app restarts.
-    data_path, meta_path = checkpoint_paths(run_key)
+    data_path, meta_path, excel_path = checkpoint_paths(run_key)
 
     result_df.to_pickle(data_path)
+    if excel_bytes is not None:
+        excel_path.write_bytes(excel_bytes)
+
     meta = {
         "processed_rows": int(processed_rows),
         "total_rows": int(total_rows),
@@ -130,7 +142,7 @@ def save_checkpoint(
 
 def load_checkpoint(run_key: str) -> tuple[Optional[pd.DataFrame], Optional[dict]]:
     # We recover checkpointed progress if it exists and is readable.
-    data_path, meta_path = checkpoint_paths(run_key)
+    data_path, meta_path, _ = checkpoint_paths(run_key)
     if not data_path.exists() or not meta_path.exists():
         return None, None
 
@@ -145,12 +157,60 @@ def load_checkpoint(run_key: str) -> tuple[Optional[pd.DataFrame], Optional[dict
 
 def clear_checkpoint(run_key: str):
     # We remove persisted progress for a run key.
-    data_path, meta_path = checkpoint_paths(run_key)
-    for path in [data_path, meta_path]:
+    data_path, meta_path, excel_path = checkpoint_paths(run_key)
+    for path in [data_path, meta_path, excel_path]:
         try:
             path.unlink()
         except FileNotFoundError:
             pass
+
+
+def load_latest_checkpoint() -> tuple[Optional[str], Optional[pd.DataFrame], Optional[dict]]:
+    # We provide a fallback recovery path when the uploader state is lost after a restart.
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    candidates = sorted(CHECKPOINT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    for meta_path in candidates:
+        run_key = meta_path.stem
+        result_df, meta = load_checkpoint(run_key)
+        if result_df is None or meta is None:
+            continue
+
+        processed = int(meta.get("processed_rows", len(result_df)))
+        if processed <= 0:
+            continue
+
+        return run_key, result_df, meta
+
+    return None, None, None
+
+
+def get_download_bytes(run_key: str, scraper, result_df: pd.DataFrame) -> bytes:
+    # We reuse a persisted xlsx when available to avoid rebuilding on each rerun.
+    _, _, excel_path = checkpoint_paths(run_key)
+    if excel_path.exists():
+        return excel_path.read_bytes()
+
+    bytes_data = scraper.dataframe_to_excel_bytes(result_df)
+    excel_path.write_bytes(bytes_data)
+    return bytes_data
+
+
+def render_download_button(label: str, data: bytes, file_name: str, key: str):
+    # We avoid unnecessary reruns on download in Streamlit versions that support it.
+    kwargs = {
+        "label": label,
+        "data": data,
+        "file_name": file_name,
+        "mime": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "width": "stretch",
+        "key": key,
+    }
+
+    if streamlit_version_tuple() >= (1, 43, 0):
+        kwargs["on_click"] = "ignore"
+
+    st.download_button(**kwargs)
 
 
 def run_processing_ui(
@@ -235,6 +295,7 @@ def run_processing_ui(
         if error_text:
             status.update(label="La ejecucion se detuvo", state="error")
             top_status.warning("La pagina parece inestable. Puedes descargar progreso y continuar.")
+            paused_excel = scraper.dataframe_to_excel_bytes(accumulated_df) if not accumulated_df.empty else None
             save_checkpoint(
                 run_key=run_key,
                 result_df=accumulated_df,
@@ -242,11 +303,13 @@ def run_processing_ui(
                 total_rows=absolute_total,
                 status="paused",
                 error_text=error_text,
+                excel_bytes=paused_excel,
             )
         else:
             progress_bar.progress(1.0)
             status.update(label="Proceso terminado", state="complete")
             top_status.success("Consulta terminada. Ya puedes revisar y descargar el archivo.")
+            completed_excel = scraper.dataframe_to_excel_bytes(accumulated_df) if not accumulated_df.empty else None
             save_checkpoint(
                 run_key=run_key,
                 result_df=accumulated_df,
@@ -254,13 +317,13 @@ def run_processing_ui(
                 total_rows=absolute_total,
                 status="completed",
                 error_text="",
+                excel_bytes=completed_excel,
             )
 
     return accumulated_df, processed_local, error_text
 
 
 def main():
-    # We render the full Streamlit interface.
     init_state()
 
     try:
@@ -310,6 +373,24 @@ def main():
 
     uploaded_file = st.file_uploader("Archivo de entrada", type=["csv", "xlsx", "xls"])
     if not uploaded_file:
+        latest_key, latest_df, latest_meta = load_latest_checkpoint()
+        if latest_df is not None and latest_meta is not None:
+            processed = int(latest_meta.get("processed_rows", len(latest_df)))
+            total = int(latest_meta.get("total_rows", processed))
+            st.warning(
+                f"Se encontro progreso guardado: {processed}/{total} radicados. "
+                "Si solo quieres rescatarlo, descarga el archivo parcial."
+            )
+            if latest_meta.get("error_text"):
+                st.caption(f"Ultimo error registrado: {latest_meta['error_text']}")
+            download_bytes = get_download_bytes(latest_key, scraper, latest_df)
+            render_download_button(
+                label="Descargar ultimo progreso guardado",
+                data=download_bytes,
+                file_name=f"resultado_rama_rescate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                key=f"download_rescue_{latest_key}_{processed}",
+            )
+            st.caption("Para continuar la consulta, vuelve a subir el mismo archivo de entrada.")
         return
 
     file_bytes = uploaded_file.getvalue()
@@ -370,18 +451,10 @@ def main():
 
     if discard_button:
         clear_checkpoint(run_key)
-        st.session_state.result_df = None
-        st.session_state.result_bytes = None
-        st.session_state.result_filename = None
-        st.session_state.run_finished = False
         st.rerun()
 
     if run_button:
         st.session_state.log_lines = []
-        st.session_state.result_df = None
-        st.session_state.result_bytes = None
-        st.session_state.result_filename = None
-        st.session_state.run_finished = False
         clear_checkpoint(run_key)
 
         output_df, _, error_text = run_processing_ui(
@@ -400,8 +473,6 @@ def main():
                 st.error("La consulta no esta retornando resultados. Por favor intenta mas tarde.")
             elif output_df.empty:
                 st.error(f"La ejecucion se detuvo antes de generar resultados: {error_text}")
-        else:
-            st.session_state.run_finished = True
 
     if continue_button and saved_df is not None:
         remaining_df = input_df.iloc[saved_processed:].copy()
@@ -419,17 +490,14 @@ def main():
 
         if error_text and output_df.empty and BLOCKED_BOOT_MESSAGE in error_text:
             st.error("La consulta no esta retornando resultados. Por favor intenta mas tarde.")
-        elif not error_text:
-            st.session_state.run_finished = True
 
-    # We reload the checkpoint after actions to always show the latest persisted state.
     display_df, display_meta = load_checkpoint(run_key)
     if display_df is not None:
         processed_rows = int(display_meta.get("processed_rows", len(display_df))) if display_meta else len(display_df)
         if display_df.empty and processed_rows == 0:
             return
-        is_partial = processed_rows < total_rows
 
+        is_partial = processed_rows < total_rows
         if is_partial:
             st.subheader("Vista previa del resultado parcial")
             filename = f"resultado_rama_parcial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -439,13 +507,12 @@ def main():
 
         st.dataframe(display_df.head(100), width="stretch")
 
-        result_bytes = scraper.dataframe_to_excel_bytes(display_df)
-        st.download_button(
+        result_bytes = get_download_bytes(run_key, scraper, display_df)
+        render_download_button(
             label="Descargar Excel resultado",
             data=result_bytes,
             file_name=filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            width="stretch",
+            key=f"download_main_{run_key}_{processed_rows}",
         )
 
         if "status_rama" in display_df.columns:
