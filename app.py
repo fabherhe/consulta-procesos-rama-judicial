@@ -177,7 +177,12 @@ def main():
                 output_bytes = dataframe_to_excel_bytes(output_df)
             except Exception as exc:
                 status.update(label="La ejecución terminó con error", state="error")
-                st.error(f"La ejecución falló: {exc}")
+                error_text = str(exc)
+                if "3 radicados validos consecutivos con 'Network Error' al inicio" in error_text:
+                    st.error("La consulta no está retornando resultados. Por favor intenta más tarde.")
+                    st.caption(f"Detalle técnico: {error_text}")
+                else:
+                    st.error(f"La ejecución falló: {exc}")
                 return
 
             progress_bar.progress(1.0)

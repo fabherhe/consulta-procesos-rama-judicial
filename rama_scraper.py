@@ -23,6 +23,7 @@ MAX_DETAIL_OPEN_RETRIES = 2
 MAX_DETAIL_DATA_RETRIES = 3
 MAX_ACTUACIONES_RETRIES = 3
 MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES = 3
+ROWS_PER_BROWSER_SESSION = 40
 
 DATE_YMD_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 DATE_MDY_RE = re.compile(r"\b\d{1,2}/\d{1,2}/\d{4}\b")
@@ -890,7 +891,7 @@ def build_base_extra_data(include_compare: bool) -> dict:
     data = {
         "popup_multiple_records_rama": False,
         "network_error_retries_rama": 0,
-        "selected_result_row_index_rama": "",
+        "selected_result_row_index_rama": None,
         "selected_result_latest_date_rama": "",
         "despacho_departamento_resumen_rama": "",
         "sujetos_procesales_raw_rama": "",
@@ -934,6 +935,12 @@ def build_base_extra_data(include_compare: bool) -> dict:
 
 def normalize_output_dataframe(df: pd.DataFrame, compare_date_col: Optional[str] = None) -> pd.DataFrame:
     # We normalize date-like columns into YYYY-MM-DD when possible.
+    if "selected_result_row_index_rama" in df.columns:
+        df["selected_result_row_index_rama"] = pd.to_numeric(
+            df["selected_result_row_index_rama"],
+            errors="coerce",
+        ).astype("Int64")
+
     date_columns = [
         "selected_result_latest_date_rama",
         "fecha_radicacion_resumen_rama",
@@ -1037,6 +1044,8 @@ def process_dataframe(
     total = len(df)
     include_compare = bool(compare_date_col)
     consecutive_search_network_failures = 0
+    valid_radicados_processed = 0
+    successful_searches = 0
 
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "/tmp/pw-browsers")
 
@@ -1050,25 +1059,39 @@ def process_dataframe(
                 "--disable-blink-features=AutomationControlled",
             ],
         )
-        context = browser.new_context(
-            user_agent=DEFAULT_USER_AGENT,
-            locale="es-CO",
-            timezone_id="America/Bogota",
-            viewport={"width": 1400, "height": 900},
-            extra_http_headers={
-                "Accept-Language": "es-CO,es;q=0.9,en-US;q=0.8,en;q=0.7",
-            },
-        )
-        page = context.new_page()
-        page.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            """
-        )
+        context = None
+        page = None
 
-        reset_to_search(page)
+        def open_fresh_page(reason: str):
+            nonlocal context, page
+            if page is not None:
+                page.close()
+            if context is not None:
+                context.close()
+
+            context = browser.new_context(
+                user_agent=DEFAULT_USER_AGENT,
+                locale="es-CO",
+                timezone_id="America/Bogota",
+                viewport={"width": 1400, "height": 900},
+                extra_http_headers={
+                    "Accept-Language": "es-CO,es;q=0.9,en-US;q=0.8,en;q=0.7",
+                },
+            )
+            page = context.new_page()
+            page.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                """
+            )
+            reset_to_search(page)
+            log(f"    -> Sesion de navegador reiniciada ({reason}).")
+
+        open_fresh_page("inicio")
 
         for idx, (_, row) in enumerate(df.iterrows(), start=1):
+            if idx > 1 and (idx - 1) % ROWS_PER_BROWSER_SESSION == 0:
+                open_fresh_page(f"mantenimiento tras {idx - 1} radicados")
             base_row = {col: safe_str(row[col]) for col in df.columns}
             rad = safe_str(base_row.get(radicado_col, ""))
             progress(idx, total, rad)
@@ -1083,11 +1106,14 @@ def process_dataframe(
                 log("    -> Radicado inválido. Se omite.")
                 continue
 
+            valid_radicados_processed += 1
+
 
             try:
                 search_info = search_with_retries(page, rad, log=log, max_retries=MAX_SEARCH_RETRIES)
                 extra_data.update(search_info)
                 consecutive_search_network_failures = 0
+                successful_searches += 1
 
                 detail_open_info = open_detail_with_retries(
                     page,
@@ -1147,6 +1173,8 @@ def process_dataframe(
                         f"Consecutivas: {consecutive_search_network_failures}/"
                         f"{MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES}."
                     )
+                    if consecutive_search_network_failures < MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES:
+                        open_fresh_page("recuperacion tras network error persistente")
                 else:
                     consecutive_search_network_failures = 0
                     extra_data["status_rama"] = "error"
@@ -1155,14 +1183,24 @@ def process_dataframe(
             resultados.append(merge_row(base_row, extra_data))
 
             if consecutive_search_network_failures >= MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES:
-                raise RuntimeError(
-                    "Se detectaron fallas de red persistentes en consultas consecutivas a Rama Judicial. "
-                    "La ejecución se detiene para evitar reprocesar todo el archivo sin resultados. "
-                    "Reintenta más tarde o despliega en otro proveedor/región."
+                # If Rama is blocking from the beginning, stop early to avoid wasting time.
+                if successful_searches == 0 and valid_radicados_processed <= MAX_CONSECUTIVE_SEARCH_NETWORK_FAILURES:
+                    raise RuntimeError(
+                        "Se detectaron 3 radicados validos consecutivos con 'Network Error' al inicio. "
+                        "Posible bloqueo activo desde el arranque. Se detiene la ejecucion para evitar procesar todo sin resultados."
+                    )
+                log(
+                    "    -> Se alcanzo el umbral de fallas consecutivas de red. "
+                    "Ya hubo consultas exitosas antes, se continuara con el siguiente radicado."
                 )
+                consecutive_search_network_failures = 0
+                open_fresh_page("umbral de fallas consecutivas")
             human_pause(1200, 2800)
 
-        context.close()
+        if page is not None:
+            page.close()
+        if context is not None:
+            context.close()
         browser.close()
 
     out_df = pd.DataFrame(resultados)
