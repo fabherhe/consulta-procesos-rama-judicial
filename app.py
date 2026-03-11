@@ -216,11 +216,8 @@ def load_latest_checkpoint() -> tuple[Optional[str], Optional[pd.DataFrame], Opt
 
 
 def get_download_bytes(run_key: str, scraper, result_df: pd.DataFrame) -> bytes:
-    # We reuse a persisted xlsx when available to avoid rebuilding on each rerun.
+    # We always rebuild from the displayed dataframe to guarantee exact consistency.
     _, _, excel_path = checkpoint_paths(run_key)
-    if excel_path.exists():
-        return excel_path.read_bytes()
-
     bytes_data = scraper.dataframe_to_excel_bytes(result_df)
     excel_path.write_bytes(bytes_data)
     return bytes_data
@@ -392,7 +389,7 @@ def main():
                 backdrop-filter: blur(4px);
             }
         </style>
-        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito</div>
+        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito 💕</div>
         """,
         unsafe_allow_html=True,
     )
@@ -407,7 +404,8 @@ def main():
         st.markdown(
             "- La app corre con Playwright en modo headless, asi que no abre navegador visible.\n"
             "- Los logs se muestran en pantalla durante la ejecucion y viven solo en la sesion actual.\n"
-            "- El progreso se guarda por bloques para poder continuar si la sesion se reinicia."
+            "- El progreso se guarda por bloques para poder continuar si la sesion se reinicia.\n"
+            "- Juanita eres preciosa mi amor."
         )
 
     uploaded_file = st.file_uploader("Archivo de entrada", type=["csv", "xlsx", "xls"])
