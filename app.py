@@ -353,7 +353,7 @@ def main():
                 backdrop-filter: blur(4px);
             }
         </style>
-        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito</div>
+        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito 💕 </div>
         """,
         unsafe_allow_html=True,
     )
