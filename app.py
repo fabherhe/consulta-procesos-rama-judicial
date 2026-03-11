@@ -7,15 +7,23 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
 
 CHUNK_SIZE = 20
+MAX_LOG_LINES = 240
+BOGOTA_TZ = ZoneInfo("America/Bogota")
 CHECKPOINT_DIR = Path(tempfile.gettempdir()) / "rama_streamlit_checkpoints"
 BLOCKED_BOOT_MESSAGE = "3 radicados validos consecutivos con 'Network Error' al inicio"
 
 st.set_page_config(page_title="Consulta Rama Judicial", page_icon="R", layout="wide")
+
+
+def now_bogota_hhmmss() -> str:
+    # We keep timestamps aligned with Colombia timezone in UI logs.
+    return datetime.now(BOGOTA_TZ).strftime("%H:%M:%S")
 
 
 def streamlit_version_tuple() -> tuple[int, int, int]:
@@ -82,10 +90,32 @@ def init_state():
 
 def append_log(message: str, container, log_box):
     # We append each log line to the in-session UI log.
-    timestamp = datetime.now().strftime("%H:%M:%S")
+    timestamp = now_bogota_hhmmss()
     st.session_state.log_lines.append(f"[{timestamp}] {message}")
+    if len(st.session_state.log_lines) > MAX_LOG_LINES:
+        st.session_state.log_lines = st.session_state.log_lines[-MAX_LOG_LINES:]
     container.caption(f"Ultimo evento: {message}")
-    log_box.code("\n".join(st.session_state.log_lines[-400:]), language="text")
+    log_box.code("\n".join(st.session_state.log_lines), language="text")
+
+
+def summarize_chunk_logs(
+    chunk_log_start: int,
+    block_start: int,
+    block_end: int,
+    container,
+    log_box,
+):
+    # We collapse per-radicado logs into one line per processed block.
+    if chunk_log_start < len(st.session_state.log_lines):
+        del st.session_state.log_lines[chunk_log_start:]
+
+    summary = f"Bloque {block_start}-{block_end} procesado."
+    st.session_state.log_lines.append(f"[{now_bogota_hhmmss()}] {summary}")
+    if len(st.session_state.log_lines) > MAX_LOG_LINES:
+        st.session_state.log_lines = st.session_state.log_lines[-MAX_LOG_LINES:]
+
+    container.caption(f"Ultimo evento: {summary}")
+    log_box.code("\n".join(st.session_state.log_lines), language="text")
 
 
 def build_run_key(
@@ -166,7 +196,7 @@ def clear_checkpoint(run_key: str):
 
 
 def load_latest_checkpoint() -> tuple[Optional[str], Optional[pd.DataFrame], Optional[dict]]:
-    # We provide a fallback recovery path when the uploader state is lost after a restart.
+    # We provide a fallback recovery path when uploader state is lost after a restart.
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     candidates = sorted(CHECKPOINT_DIR.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
 
@@ -256,10 +286,12 @@ def run_processing_ui(
         for chunk_start in range(0, len(source_df), CHUNK_SIZE):
             chunk_end = min(chunk_start + CHUNK_SIZE, len(source_df))
             chunk_df = source_df.iloc[chunk_start:chunk_end].copy()
-            ui_log(
-                f"Procesando bloque {absolute_offset + chunk_start + 1}-"
-                f"{absolute_offset + chunk_end} de {absolute_total}."
-            )
+
+            abs_start = absolute_offset + chunk_start + 1
+            abs_end = absolute_offset + chunk_end
+            chunk_log_start = len(st.session_state.log_lines)
+
+            ui_log(f"Procesando bloque {abs_start}-{abs_end} de {absolute_total}.")
 
             def chunk_progress(current: int, _chunk_total: int, rad: str, base: int = chunk_start):
                 ui_progress(absolute_offset + base + current, absolute_total, rad)
@@ -283,6 +315,13 @@ def run_processing_ui(
                 accumulated_df = pd.concat([accumulated_df, chunk_out], ignore_index=True)
 
             processed_local = chunk_end
+            summarize_chunk_logs(
+                chunk_log_start=chunk_log_start,
+                block_start=abs_start,
+                block_end=abs_end,
+                container=progress_text,
+                log_box=log_box,
+            )
             save_checkpoint(
                 run_key=run_key,
                 result_df=accumulated_df,
@@ -353,7 +392,7 @@ def main():
                 backdrop-filter: blur(4px);
             }
         </style>
-        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito 💕 </div>
+        <div class="footer-note">Esta app se crea para ahorrarle tiempo a mi amorsito</div>
         """,
         unsafe_allow_html=True,
     )
@@ -385,7 +424,7 @@ def main():
                 st.caption(f"Ultimo error registrado: {latest_meta['error_text']}")
             download_bytes = get_download_bytes(latest_key, scraper, latest_df)
             render_download_button(
-                label="Descargar ultimo progreso guardado",
+                label="Descargar progreso",
                 data=download_bytes,
                 file_name=f"resultado_rama_rescate_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
                 key=f"download_rescue_{latest_key}_{processed}",
@@ -430,29 +469,7 @@ def main():
         compare_date_col=compare_date_col,
     )
 
-    saved_df, saved_meta = load_checkpoint(run_key)
-    saved_processed = int(saved_meta.get("processed_rows", 0)) if saved_meta else 0
-    total_rows = len(input_df)
-
     run_button = st.button("Ejecutar consulta", type="primary", width="stretch")
-
-    continue_button = False
-    discard_button = False
-    if saved_df is not None and 0 < saved_processed < total_rows:
-        st.warning(
-            f"Solo pudimos extraer datos para los primeros {saved_processed} numeros de radicado. "
-            "La pagina parece estar inestable, recomendamos guardar el archivo con el progreso "
-            "y oprimir Continuar consulta para terminar el trabajo."
-        )
-        if saved_meta and saved_meta.get("error_text"):
-            st.caption(f"Detalle tecnico de la ultima pausa: {saved_meta['error_text']}")
-        continue_button = st.button("Continuar consulta", width="stretch")
-        discard_button = st.button("Descartar progreso guardado", width="stretch")
-
-    if discard_button:
-        clear_checkpoint(run_key)
-        st.rerun()
-
     if run_button:
         st.session_state.log_lines = []
         clear_checkpoint(run_key)
@@ -463,7 +480,7 @@ def main():
             radicado_col=radicado_col,
             compare_date_col=compare_date_col,
             absolute_offset=0,
-            absolute_total=total_rows,
+            absolute_total=len(input_df),
             run_key=run_key,
             base_df=None,
         )
@@ -474,56 +491,75 @@ def main():
             elif output_df.empty:
                 st.error(f"La ejecucion se detuvo antes de generar resultados: {error_text}")
 
-    if continue_button and saved_df is not None:
-        remaining_df = input_df.iloc[saved_processed:].copy()
+    display_df, display_meta = load_checkpoint(run_key)
+    if display_df is None:
+        return
 
-        output_df, _, error_text = run_processing_ui(
-            scraper=scraper,
-            source_df=remaining_df,
-            radicado_col=radicado_col,
-            compare_date_col=compare_date_col,
-            absolute_offset=saved_processed,
-            absolute_total=total_rows,
-            run_key=run_key,
-            base_df=saved_df,
+    processed_rows = int(display_meta.get("processed_rows", len(display_df))) if display_meta else len(display_df)
+    if display_df.empty and processed_rows == 0:
+        return
+
+    total_rows = len(input_df)
+    is_partial = processed_rows < total_rows
+
+    if is_partial:
+        st.warning(
+            f"Solo pudimos extraer datos para los primeros {processed_rows} numeros de radicado. "
+            "La pagina parece estar inestable, recomendamos guardar el progreso y luego continuar consulta."
+        )
+        if display_meta and display_meta.get("error_text"):
+            st.caption(f"Detalle tecnico de la ultima pausa: {display_meta['error_text']}")
+
+        partial_bytes = get_download_bytes(run_key, scraper, display_df)
+        render_download_button(
+            label="Descargar progreso",
+            data=partial_bytes,
+            file_name=f"resultado_rama_parcial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+            key=f"download_progress_{run_key}_{processed_rows}",
         )
 
-        if error_text and output_df.empty and BLOCKED_BOOT_MESSAGE in error_text:
-            st.error("La consulta no esta retornando resultados. Por favor intenta mas tarde.")
+        st.subheader("Vista previa del progreso")
+        st.dataframe(display_df.head(100), width="stretch")
 
-    display_df, display_meta = load_checkpoint(run_key)
-    if display_df is not None:
-        processed_rows = int(display_meta.get("processed_rows", len(display_df))) if display_meta else len(display_df)
-        if display_df.empty and processed_rows == 0:
-            return
+        continue_clicked = st.button("Continuar consulta", width="stretch")
+        if continue_clicked:
+            remaining_df = input_df.iloc[processed_rows:].copy()
+            output_df, _, error_text = run_processing_ui(
+                scraper=scraper,
+                source_df=remaining_df,
+                radicado_col=radicado_col,
+                compare_date_col=compare_date_col,
+                absolute_offset=processed_rows,
+                absolute_total=total_rows,
+                run_key=run_key,
+                base_df=display_df,
+            )
 
-        is_partial = processed_rows < total_rows
-        if is_partial:
-            st.subheader("Vista previa del resultado parcial")
-            filename = f"resultado_rama_parcial_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        else:
-            st.subheader("Vista previa del resultado")
-            filename = f"resultado_rama_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            if error_text and output_df.empty and BLOCKED_BOOT_MESSAGE in error_text:
+                st.error("La consulta no esta retornando resultados. Por favor intenta mas tarde.")
 
+            st.rerun()
+    else:
+        st.subheader("Vista previa del resultado")
         st.dataframe(display_df.head(100), width="stretch")
 
         result_bytes = get_download_bytes(run_key, scraper, display_df)
         render_download_button(
             label="Descargar Excel resultado",
             data=result_bytes,
-            file_name=filename,
+            file_name=f"resultado_rama_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
             key=f"download_main_{run_key}_{processed_rows}",
         )
 
-        if "status_rama" in display_df.columns:
-            st.subheader("Resumen rapido")
-            summary = (
-                display_df["status_rama"]
-                .value_counts(dropna=False)
-                .rename_axis("status_rama")
-                .reset_index(name="filas")
-            )
-            st.dataframe(summary, width="stretch")
+    if "status_rama" in display_df.columns:
+        st.subheader("Resumen rapido")
+        summary = (
+            display_df["status_rama"]
+            .value_counts(dropna=False)
+            .rename_axis("status_rama")
+            .reset_index(name="filas")
+        )
+        st.dataframe(summary, width="stretch")
 
 
 if __name__ == "__main__":

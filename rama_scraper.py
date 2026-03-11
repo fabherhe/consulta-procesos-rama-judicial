@@ -325,6 +325,11 @@ def detect_popup_kind(page):
             "Error: Network Error",
             "Network Error",
         ],
+        "no_results": [
+            "La consulta no gener",
+            "revisar las opciones ingresadas",
+            "intentarlo nuevamente",
+        ],
     }
 
     for kind, fragments in popup_patterns.items():
@@ -431,6 +436,7 @@ def search_with_retries(page, rad: str, log: LogFn, max_retries: int = 3):
             return {
                 "popup_multiple_records_rama": multiple_records_found,
                 "network_error_retries_rama": network_error_retries,
+                "no_results_rama": False,
             }
 
         if outcome == "multiple_records":
@@ -445,6 +451,16 @@ def search_with_retries(page, rad: str, log: LogFn, max_retries: int = 3):
             return {
                 "popup_multiple_records_rama": multiple_records_found,
                 "network_error_retries_rama": network_error_retries,
+                "no_results_rama": False,
+            }
+
+        if outcome == "no_results":
+            log("    -> Popup de consulta sin resultados detectado.")
+            close_popup_with_back(page)
+            return {
+                "popup_multiple_records_rama": multiple_records_found,
+                "network_error_retries_rama": network_error_retries,
+                "no_results_rama": True,
             }
 
         if outcome == "network_error":
@@ -891,6 +907,7 @@ def build_base_extra_data(include_compare: bool) -> dict:
     data = {
         "popup_multiple_records_rama": False,
         "network_error_retries_rama": 0,
+        "no_results_rama": False,
         "selected_result_row_index_rama": None,
         "selected_result_latest_date_rama": "",
         "despacho_departamento_resumen_rama": "",
@@ -1114,6 +1131,14 @@ def process_dataframe(
                 extra_data.update(search_info)
                 consecutive_search_network_failures = 0
                 successful_searches += 1
+
+                if extra_data.get("no_results_rama"):
+                    extra_data["status_rama"] = "sin_resultados"
+                    extra_data["error_rama"] = "El radicado no genero resultados en Rama Judicial."
+                    resultados.append(merge_row(base_row, extra_data))
+                    log("    -> El radicado no genero resultados. Se continua con el siguiente.")
+                    human_pause(900, 1500)
+                    continue
 
                 detail_open_info = open_detail_with_retries(
                     page,
